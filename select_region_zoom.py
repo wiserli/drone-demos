@@ -256,7 +256,7 @@ def mouse_callback(event, x, y, flags, param):
                         selected_object_id = idx
                         
                         # Initialize tracker
-                        tracker = cv2.TrackerCSRT_create()
+                        tracker = cv2.TrackerMIL_create()
                         tracker.init(zoomed_frame_for_tracking, selected_bbox)
                         is_tracking = True
                         tracking_lost_frames = 0
@@ -352,18 +352,28 @@ while True:
             if success:
                 x, y, w_box, h_box = map(int, bbox)
                 
-                # Check if tracked object still matches a detection
-                matched_id = find_matching_detection((x, y, w_box, h_box), detected_objects)
+                # In YOLO mode, check if tracked object still matches a detection
+                # In manual mode, just use the tracker result
+                if use_manual_selection:
+                    matched_id = "manual"  # Special case for manual tracking
+                else:
+                    matched_id = find_matching_detection((x, y, w_box, h_box), detected_objects)
                 
                 if matched_id is not None:
-                    # Object is still detected by YOLO - use YOLO bbox
-                    selected_object_id = matched_id
-                    selected_bbox = detected_objects[matched_id]['bbox_original']
-                    
-                    # Re-initialize tracker with YOLO detection
-                    tracker = cv2.TrackerCSRT_create()
-                    tracker.init(zoomed_frame_for_tracking, selected_bbox)
-                    tracking_lost_frames = 0
+                    # Update based on mode
+                    if use_manual_selection:
+                        # Manual mode - just use tracker bbox
+                        selected_bbox = (x, y, w_box, h_box)
+                        tracking_lost_frames = 0
+                    else:
+                        # YOLO mode - object is still detected by YOLO, use YOLO bbox
+                        selected_object_id = matched_id
+                        selected_bbox = detected_objects[matched_id]['bbox_original']
+                        
+                        # Re-initialize tracker with YOLO detection
+                        tracker = cv2.TrackerCSRT_create()
+                        tracker.init(zoomed_frame_for_tracking, selected_bbox)
+                        tracking_lost_frames = 0
                     
                     # Scale for display
                     x_obj, y_obj, w_obj, h_obj = selected_bbox
@@ -378,8 +388,12 @@ while True:
                     bbox_coords = (x_scaled, y_scaled, x_scaled + w_scaled, y_scaled + h_scaled)
                     
                     # Draw tracked object in RED
-                    draw_corner_bbox(display_frame, bbox_coords, (0, 0, 255), 
-                                   f"TRACKING: {detected_objects[matched_id]['class_name']}", thickness=3)
+                    if use_manual_selection:
+                        draw_corner_bbox(display_frame, bbox_coords, (0, 0, 255), 
+                                       "TRACKING (Manual)", thickness=3)
+                    else:
+                        draw_corner_bbox(display_frame, bbox_coords, (0, 0, 255), 
+                                       f"TRACKING: {detected_objects[matched_id]['class_name']}", thickness=3)
                     
                     # Create zoomed view
                     obj_zoom_coords = (x_obj, y_obj, x_obj + w_obj, y_obj + h_obj)
@@ -388,7 +402,8 @@ while True:
                     if object_zoomed_view is not None and object_zoomed_view.size > 0:
                         display_frame = embed_zoomed_view(display_frame, object_zoomed_view)
                 else:
-                    # Object not found in YOLO detections
+                    # Object not found in YOLO detections (only applies in YOLO mode)
+                    # In manual mode, this branch won't be reached
                     tracking_lost_frames += 1
                     
                     if tracking_lost_frames >= MAX_LOST_FRAMES:
@@ -402,7 +417,7 @@ while True:
                         cv2.putText(display_frame, "Object Lost - Click to select new target", 
                                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
                     else:
-                        # Still trying to track
+                        # Still trying to track (uncertain state)
                         selected_bbox = (x, y, w_box, h_box)
                         scale_x = display_frame.shape[1] / zoomed_frame_for_tracking.shape[1]
                         scale_y = display_frame.shape[0] / zoomed_frame_for_tracking.shape[0]
