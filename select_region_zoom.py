@@ -1,5 +1,3 @@
-# =============================================================== manual + yoo ==================================================
-
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -10,6 +8,7 @@ model = YOLO("drone_m_1280.pt")
 # Initialize variables
 zoom_region = None  # The area to zoom into
 selected_bbox = None
+selected_object_id = None  # Track which detected object is selected
 tracker = None
 zoom_factor = 2.0
 is_tracking = False
@@ -19,13 +18,16 @@ playback_speed = 30
 mode = "select_zoom"  # Modes: "select_zoom" or "detect_objects"
 detected_objects = []  # Store detected objects in zoomed region
 use_manual_selection = False  # Toggle between YOLO and manual selection
+tracking_lost_frames = 0  # Counter for consecutive lost frames
+MAX_LOST_FRAMES = 5  # Stop tracking after this many lost frames
+input_video_path = "followcar.mp4"
 
-def draw_corner_bbox(frame, bbox, color, label):
+def draw_corner_bbox(frame, bbox, color, label, thickness=2):
     x1, y1, x2, y2 = map(int, bbox)
     
     # Corner length
     corner_length = min((x2 - x1), (y2 - y1)) // 10
-    corner_thickness = 2
+    corner_thickness = thickness
 
     # Top-left corner
     cv2.line(frame, (x1, y1), (x1 + corner_length, y1), color, corner_thickness)
@@ -111,10 +113,55 @@ def embed_zoomed_view(main_frame, zoomed_frame, position='top_right'):
     
     return main_frame
 
+def calculate_iou(box1, box2):
+    """Calculate Intersection over Union between two boxes"""
+    x1_1, y1_1, x2_1, y2_1 = box1
+    x1_2, y1_2, x2_2, y2_2 = box2
+    
+    # Calculate intersection area
+    x_left = max(x1_1, x1_2)
+    y_top = max(y1_1, y1_2)
+    x_right = min(x2_1, x2_2)
+    y_bottom = min(y2_1, y2_2)
+    
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+    
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+    
+    # Calculate union area
+    box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+    box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+    union_area = box1_area + box2_area - intersection_area
+    
+    return intersection_area / union_area if union_area > 0 else 0.0
+
+def find_matching_detection(tracked_bbox, detected_objects, iou_threshold=0.3):
+    """Find which detected object matches the tracked bbox"""
+    if not detected_objects:
+        return None
+    
+    x, y, w, h = tracked_bbox
+    tracked_box = (x, y, x + w, y + h)
+    
+    best_match = None
+    best_iou = iou_threshold
+    
+    for idx, obj in enumerate(detected_objects):
+        x1, y1, w1, h1 = obj['bbox_original']
+        det_box = (x1, y1, x1 + w1, y1 + h1)
+        
+        iou = calculate_iou(tracked_box, det_box)
+        if iou > best_iou:
+            best_iou = iou
+            best_match = idx
+    
+    return best_match
+
 def mouse_callback(event, x, y, flags, param):
     global drawing, start_point, selected_bbox, tracker, is_tracking
     global zoom_region, mode, zoomed_frame_display, detected_objects, zoomed_frame_for_tracking
-    global use_manual_selection
+    global use_manual_selection, selected_object_id, tracking_lost_frames
     
     if mode == "select_zoom":
         # First mode: manually draw zoom region
@@ -189,31 +236,35 @@ def mouse_callback(event, x, y, flags, param):
                 
                 if width > 5 and height > 5:
                     selected_bbox = (x1_original, y1_original, width, height)
+                    selected_object_id = None
                     
                     # Initialize tracker
                     tracker = cv2.TrackerCSRT_create()
                     tracker.init(zoomed_frame_for_tracking, selected_bbox)
                     is_tracking = True
+                    tracking_lost_frames = 0
                     print(f"Manual tracking started - bbox: {selected_bbox}")
                 else:
                     print("Selection too small. Please try again.")
         else:
             # YOLO mode: click on detected objects
             if event == cv2.EVENT_LBUTTONDOWN:
-                for obj in detected_objects:
+                for idx, obj in enumerate(detected_objects):
                     x1, y1, x2, y2 = obj['bbox_scaled']
                     if x1 <= x <= x2 and y1 <= y <= y2:
                         selected_bbox = obj['bbox_original']
+                        selected_object_id = idx
                         
                         # Initialize tracker
-                        tracker = cv2.TrackerMIL_create()
+                        tracker = cv2.TrackerCSRT_create()
                         tracker.init(zoomed_frame_for_tracking, selected_bbox)
                         is_tracking = True
+                        tracking_lost_frames = 0
                         print(f"Tracking started on {obj['class_name']} - bbox: {selected_bbox}")
                         return
 
 # Open video capture
-cap = cv2.VideoCapture("12762043-hd_1280_720_60fps.mp4")
+cap = cv2.VideoCapture(input_video_path)
 
 # Create window
 cv2.namedWindow("Manual Object Tracking")
@@ -259,96 +310,153 @@ while True:
         
         display_frame = zoomed_frame_display.copy()
         
-        # Run YOLO detection on the zoomed frame if not tracking yet
-        if not is_tracking:
-            if use_manual_selection:
-                # Manual mode - show instruction
-                cv2.putText(display_frame, "MANUAL MODE: Draw a box around target object", 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            else:
-                # YOLO mode - run detection
-                results = model(zoomed_frame_for_tracking, verbose=False)
-                detected_objects = []
-                
-                if len(results[0].boxes) > 0:
-                    for box, cls, conf in zip(results[0].boxes.xyxy, results[0].boxes.cls, results[0].boxes.conf):
-                        x_obj1, y_obj1, x_obj2, y_obj2 = box.cpu().numpy()
-                        class_id = int(cls.cpu().numpy())
-                        class_name = model.names[class_id]
-                        confidence = float(conf.cpu().numpy())
-                        
-                        # Store original bbox (in zoomed frame coordinates)
-                        width = x_obj2 - x_obj1
-                        height = y_obj2 - y_obj1
-                        bbox_original = (int(x_obj1), int(y_obj1), int(width), int(height))
-                        
-                        # Scale coordinates to display frame
-                        scale_x = display_frame.shape[1] / zoomed_frame_for_tracking.shape[1]
-                        scale_y = display_frame.shape[0] / zoomed_frame_for_tracking.shape[0]
-                        
-                        x_scaled1 = int(x_obj1 * scale_x)
-                        y_scaled1 = int(y_obj1 * scale_y)
-                        x_scaled2 = int(x_obj2 * scale_x)
-                        y_scaled2 = int(y_obj2 * scale_y)
-                        
-                        bbox_scaled = (x_scaled1, y_scaled1, x_scaled2, y_scaled2)
-                        
-                        detected_objects.append({
-                            'bbox_original': bbox_original,
-                            'bbox_scaled': bbox_scaled,
-                            'class_name': class_name,
-                            'confidence': confidence
-                        })
-                        
-                        # Draw detection on display frame
-                        draw_corner_bbox(display_frame, bbox_scaled, (0, 255, 0), 
-                                       f"{class_name} {confidence:.2f}")
+        # Always run YOLO detection on the zoomed frame
+        if not use_manual_selection:
+            results = model(zoomed_frame_for_tracking, verbose=False)
+            detected_objects = []
+            
+            if len(results[0].boxes) > 0:
+                for box, cls, conf in zip(results[0].boxes.xyxy, results[0].boxes.cls, results[0].boxes.conf):
+                    x_obj1, y_obj1, x_obj2, y_obj2 = box.cpu().numpy()
+                    class_id = int(cls.cpu().numpy())
+                    class_name = model.names[class_id]
+                    confidence = float(conf.cpu().numpy())
                     
-                    cv2.putText(display_frame, f"YOLO: {len(detected_objects)} objects - Click to track or press 'm' for manual", 
-                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                else:
-                    cv2.putText(display_frame, "YOLO: No objects detected - Press 'm' to switch to manual mode", 
-                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                    # Store original bbox (in zoomed frame coordinates)
+                    width = x_obj2 - x_obj1
+                    height = y_obj2 - y_obj1
+                    bbox_original = (int(x_obj1), int(y_obj1), int(width), int(height))
+                    
+                    # Scale coordinates to display frame
+                    scale_x = display_frame.shape[1] / zoomed_frame_for_tracking.shape[1]
+                    scale_y = display_frame.shape[0] / zoomed_frame_for_tracking.shape[0]
+                    
+                    x_scaled1 = int(x_obj1 * scale_x)
+                    y_scaled1 = int(y_obj1 * scale_y)
+                    x_scaled2 = int(x_obj2 * scale_x)
+                    y_scaled2 = int(y_obj2 * scale_y)
+                    
+                    bbox_scaled = (x_scaled1, y_scaled1, x_scaled2, y_scaled2)
+                    
+                    detected_objects.append({
+                        'bbox_original': bbox_original,
+                        'bbox_scaled': bbox_scaled,
+                        'class_name': class_name,
+                        'confidence': confidence
+                    })
         
         # If tracking is active, update tracker
         if is_tracking and tracker is not None:
             success, bbox = tracker.update(zoomed_frame_for_tracking)
             
             if success:
-                # Convert bbox to (x1, y1, x2, y2) for drawing
                 x, y, w_box, h_box = map(int, bbox)
-                selected_bbox = (x, y, w_box, h_box)
                 
-                # Scale coordinates to display frame
-                scale_x = display_frame.shape[1] / zoomed_frame_for_tracking.shape[1]
-                scale_y = display_frame.shape[0] / zoomed_frame_for_tracking.shape[0]
+                # Check if tracked object still matches a detection
+                matched_id = find_matching_detection((x, y, w_box, h_box), detected_objects)
                 
-                x_scaled = int(x * scale_x)
-                y_scaled = int(y * scale_y)
-                w_scaled = int(w_box * scale_x)
-                h_scaled = int(h_box * scale_y)
-                
-                bbox_coords = (x_scaled, y_scaled, x_scaled + w_scaled, y_scaled + h_scaled)
-                
-                # Draw corner bbox
-                draw_corner_bbox(display_frame, bbox_coords, (0, 0, 255), "Target")
-                
-                # Create even more zoomed view of the tracked object
-                obj_zoom_coords = (x, y, x + w_box, y + h_box)
-                object_zoomed_view = crop_and_zoom(zoomed_frame_for_tracking, obj_zoom_coords, zoom_factor)
-                
-                # Embed zoomed view
-                if object_zoomed_view is not None and object_zoomed_view.size > 0:
-                    display_frame = embed_zoomed_view(display_frame, object_zoomed_view)
-                
-                # Show info
-                cv2.putText(display_frame, f"Tracking Target", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                if matched_id is not None:
+                    # Object is still detected by YOLO - use YOLO bbox
+                    selected_object_id = matched_id
+                    selected_bbox = detected_objects[matched_id]['bbox_original']
+                    
+                    # Re-initialize tracker with YOLO detection
+                    tracker = cv2.TrackerCSRT_create()
+                    tracker.init(zoomed_frame_for_tracking, selected_bbox)
+                    tracking_lost_frames = 0
+                    
+                    # Scale for display
+                    x_obj, y_obj, w_obj, h_obj = selected_bbox
+                    scale_x = display_frame.shape[1] / zoomed_frame_for_tracking.shape[1]
+                    scale_y = display_frame.shape[0] / zoomed_frame_for_tracking.shape[0]
+                    
+                    x_scaled = int(x_obj * scale_x)
+                    y_scaled = int(y_obj * scale_y)
+                    w_scaled = int(w_obj * scale_x)
+                    h_scaled = int(h_obj * scale_y)
+                    
+                    bbox_coords = (x_scaled, y_scaled, x_scaled + w_scaled, y_scaled + h_scaled)
+                    
+                    # Draw tracked object in RED
+                    draw_corner_bbox(display_frame, bbox_coords, (0, 0, 255), 
+                                   f"TRACKING: {detected_objects[matched_id]['class_name']}", thickness=3)
+                    
+                    # Create zoomed view
+                    obj_zoom_coords = (x_obj, y_obj, x_obj + w_obj, y_obj + h_obj)
+                    object_zoomed_view = crop_and_zoom(zoomed_frame_for_tracking, obj_zoom_coords, zoom_factor)
+                    
+                    if object_zoomed_view is not None and object_zoomed_view.size > 0:
+                        display_frame = embed_zoomed_view(display_frame, object_zoomed_view)
+                else:
+                    # Object not found in YOLO detections
+                    tracking_lost_frames += 1
+                    
+                    if tracking_lost_frames >= MAX_LOST_FRAMES:
+                        # Stop tracking - object is gone
+                        is_tracking = False
+                        tracker = None
+                        selected_bbox = None
+                        selected_object_id = None
+                        tracking_lost_frames = 0
+                        print("Object disappeared from detections. Click to select new target.")
+                        cv2.putText(display_frame, "Object Lost - Click to select new target", 
+                                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                    else:
+                        # Still trying to track
+                        selected_bbox = (x, y, w_box, h_box)
+                        scale_x = display_frame.shape[1] / zoomed_frame_for_tracking.shape[1]
+                        scale_y = display_frame.shape[0] / zoomed_frame_for_tracking.shape[0]
+                        
+                        x_scaled = int(x * scale_x)
+                        y_scaled = int(y * scale_y)
+                        w_scaled = int(w_box * scale_x)
+                        h_scaled = int(h_box * scale_y)
+                        
+                        bbox_coords = (x_scaled, y_scaled, x_scaled + w_scaled, y_scaled + h_scaled)
+                        
+                        # Draw in YELLOW to show uncertain tracking
+                        draw_corner_bbox(display_frame, bbox_coords, (0, 255, 255), 
+                                       f"UNCERTAIN ({MAX_LOST_FRAMES - tracking_lost_frames})", thickness=3)
+                        
+                        cv2.putText(display_frame, f"Warning: Object not detected ({tracking_lost_frames}/{MAX_LOST_FRAMES})", 
+                                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             else:
-                # Tracking failed
-                cv2.putText(display_frame, "Tracking Lost - Press 'r' to Reset", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                is_tracking = False
+                # Tracker failed
+                tracking_lost_frames += 1
+                
+                if tracking_lost_frames >= MAX_LOST_FRAMES:
+                    is_tracking = False
+                    tracker = None
+                    selected_bbox = None
+                    selected_object_id = None
+                    tracking_lost_frames = 0
+                    print("Tracking failed. Click to select new target.")
+        
+        # Draw all YOLO detections in GREEN (except tracked one)
+        if not use_manual_selection:
+            for idx, obj in enumerate(detected_objects):
+                if idx == selected_object_id and is_tracking:
+                    continue  # Skip drawing - already drawn in RED above
+                
+                draw_corner_bbox(display_frame, obj['bbox_scaled'], (0, 255, 0), 
+                               f"{obj['class_name']} {obj['confidence']:.2f}")
+        
+        # Show status message
+        if not is_tracking:
+            if use_manual_selection:
+                cv2.putText(display_frame, "MANUAL MODE: Draw a box around target object", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            else:
+                if len(detected_objects) > 0:
+                    cv2.putText(display_frame, f"YOLO: {len(detected_objects)} objects - Click to track", 
+                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                else:
+                    cv2.putText(display_frame, "YOLO: No objects detected - Press 'm' for manual mode", 
+                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+        else:
+            status_text = f"Tracking | Objects: {len(detected_objects)}"
+            cv2.putText(display_frame, status_text, (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
     else:
         # Show original frame with instruction
         display_frame = current_frame.copy()
@@ -367,18 +475,28 @@ while True:
         is_tracking = False
         tracker = None
         selected_bbox = None
+        selected_object_id = None
         zoom_region = None
         mode = "select_zoom"
         detected_objects = []
         use_manual_selection = False
+        tracking_lost_frames = 0
         print("Reset complete. Select zoom region again.")
     elif key == ord("m"):
         # Toggle between YOLO and manual mode
-        if not is_tracking and zoom_region is not None:
+        if zoom_region is not None:
             use_manual_selection = not use_manual_selection
             detected_objects = []
             mode_name = "MANUAL" if use_manual_selection else "YOLO"
             print(f"Switched to {mode_name} mode")
+            # Stop tracking when switching modes
+            if is_tracking:
+                is_tracking = False
+                tracker = None
+                selected_bbox = None
+                selected_object_id = None
+                tracking_lost_frames = 0
+                print("Tracking stopped. Select a new target.")
     elif key == ord("+"):
         # Increase zoom on tracked object
         zoom_factor += 0.5
