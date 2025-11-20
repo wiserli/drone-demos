@@ -29,6 +29,9 @@ zoom_sequence_active = False
 last_zoom_time = None
 paused = False
 attack_mode = False
+# smoothing variables (new)
+current_zoom_factor = 1.0   # actual zoom used for rendering (will approach zoom_factor)
+zoom_smooth_alpha = 0.12    # interpolation speed: 0.02 = very slow, 0.3 = snappy
 
 tick_freq = cv2.getTickFrequency()
 
@@ -316,6 +319,14 @@ while True:
         h, w = frame.shape[:2]
         zoomed_frame_display = cv2.resize(zoomed_frame_for_tracking, (w, h))
 
+                # --- SMOOTH THE ZOOM FACTOR (NEW) ---
+        current_zoom_factor += (zoom_factor - current_zoom_factor) * zoom_smooth_alpha
+
+        # Small clamp to avoid tiny jitter
+        if abs(current_zoom_factor - zoom_factor) < 0.001:
+            current_zoom_factor = zoom_factor
+
+
         display_frame = zoomed_frame_display.copy()
 
         # Always run YOLO detection on the zoomed frame (if in YOLO mode)
@@ -412,8 +423,9 @@ while True:
                     object_zoomed_view, crop_coords = crop_and_zoom(
                         zoomed_frame_for_tracking,
                         obj_zoom_coords,
-                        zoom_factor
+                        current_zoom_factor
                     )
+
 
                     if object_zoomed_view is not None and object_zoomed_view.size > 0:
                         # Resize object view to full window
